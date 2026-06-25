@@ -1,0 +1,391 @@
+import os
+import re
+import json
+import random
+import asyncio
+import unicodedata
+import discord
+from discord.ext import commands, tasks
+from flask import Flask
+from threading import Thread
+
+# ---------- CONFIG ----------
+TOKEN = os.environ["DISCORD_TOKEN"]
+
+PING_IDS = [1217184041200124025, 1511540345270173697]
+STAFF_PING_ID = PING_IDS[0]
+OWNER_ID = PING_IDS[0]
+
+KEYWORDS = ["traited garama", "mutated garama", "dragon", "other brainrot"]
+
+KEYS_FILE = "keys.json"
+
+# channel_id -> creator (discord.Member)
+ticket_creators = {}
+
+# Track owner's last known online status to detect changes
+owner_was_online = {}  # guild_id -> bool
+
+# ---------- KEYS ----------
+def load_keys():
+    with open(KEYS_FILE, "r") as f:
+        return json.load(f)
+
+def save_keys(data):
+    with open(KEYS_FILE  , "w") as f:
+        json.dump(data, f, indent=2)
+
+# ---------- HELPERS ----------
+def clean_channel_name(name: str) -> str:
+    ascii_name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode('ascii')
+    cleaned = re.sub(r'[^a-zA-Z0-9]', '', ascii_name).lower()
+    return cleaned
+
+def is_ticket_channel(channel: discord.TextChannel) -> bool:
+    cleaned = clean_channel_name(channel.name)
+    return "ticket" in cleaned and cleaned != "tickets"
+
+def find_channel_with(guild: discord.Guild, keyword: str):
+    for ch in guild.text_channels:
+        if keyword in clean_channel_name(ch.name):
+            return ch
+    return None
+
+def extract_number(channel_name: str) -> int:
+    nums = re.findall(r'\d+', channel_name)
+    return int(nums[-1]) if nums else 0
+
+def is_authorized(ctx) -> bool:
+    return ctx.author.id in PING_IDS
+
+async def deny(ctx):
+    embed = discord.Embed(
+        description="You cannot run this command!",
+        color=discord.Color.yellow()
+    )
+    await ctx.send(embed=embed)
+
+def is_online(status: discord.Status) -> bool:
+    return status in (discord.Status.online, discord.Status.idle, discord.Status.dnd)
+
+# ---------- BOT SETUP ----------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+intents.presences = True
+
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# ---------- TICKET HELPERS ----------
+async def already_sent(channel: discord.TextChannel) -> bool:
+    try:
+        async for msg in channel.history(limit=50):
+            if msg.author.id == bot.user.id:
+                return True
+    except discord.Forbidden:
+        pass
+    return False
+
+async def get_ticket_creator(channel: discord.TextChannel):
+    for target, overwrite in channel.overwrites.items():
+        if isinstance(target, discord.Member) and not target.bot:
+            return target
+    try:
+        async for msg in channel.history(limit=20, oldest_first=True):
+            if not msg.author.bot:
+                return msg.author
+    except discord.Forbidden:
+        pass
+    return None
+
+async def send_ticket_message(channel: discord.TextChannel):
+    if await already_sent(channel):
+        print(f"[SKIP] Already sent in #{channel.name}")
+        return
+
+    creator = await get_ticket_creator(channel)
+    ticket_creators[channel.id] = creator
+
+    creator_mention = creator.mention if creator else ""
+    ping_ids_str = " ".join(f"<@{uid}>" for uid in PING_IDS)
+
+    message1 = (
+        "Hey! This is our **Discord Bot** to provide help with tickets, "
+        "What would you like to buy with? Remember, our prices are "
+        "**Colored Garama** = 60 Days | **Traited Garama** = 30 Days | "
+        "**Dragon** = LIFETIME ////// ONLY PEOPLE WHO HAS SCRIPT "
+        f"{ping_ids_str} //// {creator_mention}"
+    )
+
+    message2 = (
+        'Say **"Traited Garama"** if you have a Traited Garama  |  '
+        'Say **"Mutated Garama"** if you have a Mutated Garama  |  '
+        'Say **"Dragon"** if you have a Dragon  |  '
+        'Say **"Other Brainrot"** if you have another Brainrot'
+    )
+
+    try:
+        await channel.send(message1)
+        await asyncio.sleep(1)
+        await channel.send(message2)
+        print(f"[SENT] #{channel.name}")
+    except discord.Forbidden:
+        print(f"[ERROR] No permission in #{channel.name}")
+
+# ---------- TASKS ----------
+@tasks.loop(hours=3)
+async def chat_message():
+    for guild in bot.guilds:
+        channel = find_channel_with(guild, "chat")
+        if channel:
+            try:
+                await channel.send("Hello! how are yall doing @here")
+            except discord.Forbidden:
+                pass
+
+@chat_message.before_loop
+async def before_chat():
+    await bot.wait_until_ready()
+
+# ---------- EVENTS ----------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    chat_message.start()
+
+    # Seed the initial online status for all guilds
+    for guild in bot.guilds:
+        member = guild.get_member(OWNER_ID)
+        if member:
+            owner_was_online[guild.id] = is_online(member.status)
+
+@bot.event
+async def on_presence_update(before: discord.Member, after: discord.Member):
+    if after.id != OWNER_ID:
+        return
+
+    guild = after.guild
+    was_online = owner_was_online.get(guild.id, False)
+    now_online = is_online(after.status)
+
+    if was_online == now_online:
+        return
+
+    owner_was_online[guild.id] = now_online
+
+    tickets_channel = find_channel_with(guild, "tickets")
+    if not tickets_channel:
+        return
+
+    if now_online:
+        msg = "Tigy's Online! @here\nOpen a ticket if you want to buy Code Redeemer!!"
+    else:
+        msg = "Tigy's Offline, **Please wait until he's online so you can get assisted within a few minutes!**"
+
+    try:
+        await tickets_channel.send(msg)
+    except discord.Forbidden:
+        pass
+
+@bot.event
+async def on_guild_channel_create(channel):
+    if not isinstance(channel, discord.TextChannel):
+        return
+    if not is_ticket_channel(channel):
+        return
+    await asyncio.sleep(3)
+    await send_ticket_message(channel)
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if not is_ticket_channel(message.channel):
+        await bot.process_commands(message)
+        return
+
+    content_lower = message.content.lower().strip()
+
+    if content_lower in KEYWORDS:
+        creator = ticket_creators.get(message.channel.id)
+        if creator is None:
+            creator = await get_ticket_creator(message.channel)
+            ticket_creators[message.channel.id] = creator
+
+        creator_mention = creator.mention if creator else ""
+
+        response = (
+            f"{creator_mention} Send a Trade Request to **PizzaRobiox** in **Steal a Brainrot**. "
+            f"Once you provide your payment, Ping <@{STAFF_PING_ID}>"
+        )
+        await message.channel.send(response)
+
+    await bot.process_commands(message)
+
+# ---------- COMMANDS ----------
+async def deliver_key(ctx, tier: str):
+    data = load_keys()
+    keys = data.get(tier, [])
+
+    if not keys:
+        await ctx.send("No More Keys!")
+        return
+
+    key = random.choice(keys)
+    keys.remove(key)
+    data[tier] = keys
+    save_keys(data)
+
+    script = (
+        f'SCRIPT\n'
+        f'```\n'
+        f'getgenv().SCRIPT_KEY = "{key}"\n'
+        f'loadstring(game:HttpGet("https://api.jnkie.com/api/v1/luascripts/public/b8b872bc152067b2c4e1672bd00a69618180fb62bf6cf8dbfd92f95a75835c34/download"))()\n'
+        f'```'
+    )
+
+    creator = ticket_creators.get(ctx.channel.id)
+    if creator is None:
+        creator = await get_ticket_creator(ctx.channel)
+        if creator:
+            ticket_creators[ctx.channel.id] = creator
+
+    if creator:
+        try:
+            await creator.send(script)
+            await ctx.send(
+                f"{creator.mention} **Your script is ready!** PLEASE check your dm's. i sent you your script :3"
+            )
+        except discord.Forbidden:
+            await ctx.send(f"{creator.mention} **Your script is ready!** (Could not DM you — please open your DMs!)")
+    else:
+        await ctx.send("Could not find the ticket creator to DM.")
+
+@bot.command(name="help")
+async def help_command(ctx):
+    embed = discord.Embed(
+        title="Bot Commands",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="!help", value="Shows this list of commands.", inline=False)
+    embed.add_field(name="!send", value="Sends the ticket greeting to all ticket channels that haven't received it yet.", inline=False)
+    embed.add_field(name="!send-key-30d", value="DMs a 30-day script key to the ticket creator. *(Authorized only)*", inline=False)
+    embed.add_field(name="!send-key-60d", value="DMs a 60-day script key to the ticket creator. *(Authorized only)*", inline=False)
+    embed.add_field(name="!delete-tickets", value="Deletes all ticket channels in order. *(Authorized only)*", inline=False)
+    embed.add_field(name="!delete-closed", value="Deletes all closed ticket channels in order. *(Authorized only)*", inline=False)
+    await ctx.send(embed=embed)
+
+@bot.command(name="send-key-30d")
+async def send_key_30d(ctx):
+    if not is_authorized(ctx):
+        await deny(ctx)
+        return
+    await deliver_key(ctx, "30d")
+
+@bot.command(name="send-key-60d")
+async def send_key_60d(ctx):
+    if not is_authorized(ctx):
+        await deny(ctx)
+        return
+    await deliver_key(ctx, "60d")
+
+@bot.command(name="delete-tickets")
+async def delete_tickets(ctx):
+    if not is_authorized(ctx):
+        await deny(ctx)
+        return
+
+    channels = [ch for ch in ctx.guild.text_channels if is_ticket_channel(ch)]
+    if not channels:
+        await ctx.send("No ticket channels found.")
+        return
+
+    channels.sort(key=lambda ch: extract_number(ch.name))
+    await ctx.send(f"Deleting {len(channels)} ticket channel(s)...")
+
+    deleted = 0
+    for channel in channels:
+        try:
+            await channel.delete(reason="!delete-tickets command")
+            deleted += 1
+            await asyncio.sleep(0.5)
+        except discord.Forbidden:
+            await ctx.send(f"No permission to delete #{channel.name}.")
+        except discord.NotFound:
+            pass
+
+    try:
+        await ctx.send(f"Done. Deleted {deleted} ticket channel(s).")
+    except discord.NotFound:
+        pass
+
+@bot.command(name="delete-closed")
+async def delete_closed(ctx):
+    if not is_authorized(ctx):
+        await deny(ctx)
+        return
+
+    channels = [ch for ch in ctx.guild.text_channels if "closed" in clean_channel_name(ch.name)]
+    if not channels:
+        await ctx.send("No closed ticket channels found.")
+        return
+
+    channels.sort(key=lambda ch: extract_number(ch.name))
+    await ctx.send(f"Deleting {len(channels)} closed channel(s)...")
+
+    deleted = 0
+    for channel in channels:
+        try:
+            await channel.delete(reason="!delete-closed command")
+            deleted += 1
+            await asyncio.sleep(0.5)
+        except discord.Forbidden:
+            await ctx.send(f"No permission to delete #{channel.name}.")
+        except discord.NotFound:
+            pass
+
+    try:
+        await ctx.send(f"Done. Deleted {deleted} closed channel(s).")
+    except discord.NotFound:
+        pass
+
+@bot.command(name="send")
+async def send_to_tickets(ctx):
+    if not is_authorized(ctx):
+        await deny(ctx)
+        return
+
+    ticket_channels = [ch for ch in ctx.guild.text_channels if is_ticket_channel(ch)]
+    if not ticket_channels:
+        await ctx.send("No ticket channels found.")
+        return
+
+    sent = 0
+    skipped = 0
+    for channel in ticket_channels:
+        if await already_sent(channel):
+            skipped += 1
+            continue
+        await send_ticket_message(channel)
+        sent += 1
+
+    await ctx.send(f"Sent to {sent} ticket channel(s). Skipped {skipped} (already sent).")
+
+# ---------- KEEP-ALIVE WEB SERVER ----------
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+if __name__ == "__main__":
+    keep_alive()
+    bot.run(TOKEN)
